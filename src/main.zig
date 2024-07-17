@@ -6,13 +6,61 @@ const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 
 const Client = struct {
+    const Self = @This();
+
+    epfd: i32,
     c: std.net.Server.Connection,
     ev: linux.epoll_event,
     rbuf: [2048]u8,
     wbuf: [2048]u8,
-    wlen: i32,
+    wlen: usize,
 
-    pub fn write(_: []u8) void {}
+    pub fn write(self: *Self, data: []const u8) !void {
+        var sum: usize = 0;
+        var send_buf_size = data.len;
+
+        while (send_buf_size > 0) {
+            const n = self.c.stream.write(data) catch |err| switch (err) {
+                error.WouldBlock => {
+                    log.info("buffer is full", .{});
+                    // todo: 将未写完的数据加入缓冲区
+                    var l = sum + 2048;
+                    if (l > data.len) {
+                        l = data.len;
+                    }
+                    @memcpy(self.wbuf[0..], data[sum..l]);
+                    self.wlen = l - sum;
+                    var ev: linux.epoll_event = .{
+                        .events = linux.EPOLL.OUT | linux.EPOLL.IN | linux.EPOLL.ET,
+                        .data = linux.epoll_data{ .fd = self.c.stream.handle },
+                    };
+                    try posix.epoll_ctl(self.epfd, linux.EPOLL.CTL_MOD, self.c.stream.handle, &ev);
+                    return;
+                },
+                else => {
+                    log.err("client {d} write data error. {?}", .{ self.c.stream.handle, err });
+                    return;
+                },
+            };
+            sum += n;
+            log.info("write data {d} success", .{sum});
+            send_buf_size -= n;
+        }
+    }
+
+    pub fn epoll_write(self: *Self) !void {
+        _ = try self.c.stream.write(self.wbuf[0..self.wlen]);
+        self.wlen = 0;
+        var ev: linux.epoll_event = .{
+            .events = linux.EPOLL.IN | linux.EPOLL.ET,
+            .data = linux.epoll_data{ .fd = self.c.stream.handle },
+        };
+        try posix.epoll_ctl(self.epfd, linux.EPOLL.CTL_MOD, self.c.stream.handle, &ev);
+    }
+
+    pub fn close(self: *Self) void {
+        self.c.stream.close();
+    }
 };
 const host = "127.0.0.1";
 const port = 8080;
@@ -37,7 +85,7 @@ const Server = struct {
         std.log.info("server deinit: {d}", .{max_size});
         var it = self.*.clients.iterator();
         while (it.next()) |kv| {
-            kv.value_ptr.c.stream.close();
+            kv.value_ptr.close();
         }
         self.*.clients.deinit();
     }
@@ -52,6 +100,7 @@ const Server = struct {
 
             const key = connect.stream.handle;
             try self.*.clients.put(key, .{
+                .epfd = epfd,
                 .c = connect,
                 .ev = .{
                     .events = linux.EPOLL.IN | linux.EPOLL.ET,
@@ -66,6 +115,9 @@ const Server = struct {
             const client = self.*.clients.getPtr(connect.stream.handle);
 
             try posix.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, connect.stream.handle, &client.?.*.ev);
+            _ = std.Thread.spawn(.{}, write_hello, .{client.?}) catch |err| {
+                log.err("failed to run write hello thread. {?}", .{err});
+            };
             log.info("new connect {d}", .{connect.stream.handle});
         } else {
             log.err("unknown type: {d}", .{e.events});
@@ -99,13 +151,12 @@ const Server = struct {
 
             if (e.events & linux.EPOLL.OUT > 0) {
                 log.info("client write event: {d}", .{e.data.fd});
-                const l = client.c.stream.write(client.wbuf[0..@intCast(client.wlen)]) catch |err| {
+                client.epoll_write() catch |err| {
                     log.err("failed to write data: {?}", .{err});
                     _ = self.*.clients.remove(e.data.fd);
                     return;
                 };
-                // todo: 写事件处理完后需要操作epoll_ctl删除监听
-                log.info("write data success, len: {d}", .{l});
+                log.info("epoll write data success", .{});
             }
         }
     }
@@ -164,6 +215,25 @@ const Server = struct {
         self.running = false;
     }
 };
+
+fn write_hello(client: *Client) void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    defer {
+        const gpa_deinit_status = gpa.deinit();
+        if (gpa_deinit_status == .leak) @panic("TEST FAIL");
+    }
+    const data = allocator.alloc(u8, 20480000) catch |err| {
+        log.err("failed to create write data. {?}", .{err});
+        return;
+    };
+    defer allocator.free(data);
+
+    std.time.sleep(std.time.ns_per_s * 1);
+    client.write(data) catch |err| {
+        log.err("write hello error. {?}", .{err});
+    };
+}
 
 fn stop_server(server: *Server) void {
     log.info("run stop server thread", .{});
