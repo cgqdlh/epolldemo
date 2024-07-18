@@ -11,9 +11,27 @@ const Client = struct {
     epfd: i32,
     c: std.net.Server.Connection,
     ev: linux.epoll_event,
+    wfifo: std.fifo.LinearFifo(u8, .Dynamic),
     rbuf: [2048]u8,
-    wbuf: [2048]u8,
-    wlen: usize,
+    // wbuf: [2048]u8,
+    // wlen: usize,
+
+    pub fn init(allocator: Allocator, epfd: i32, conn: std.net.Server.Connection, ev: linux.epoll_event) !Self {
+        return .{
+            .epfd = epfd,
+            .c = conn,
+            .ev = ev,
+            .rbuf = undefined,
+            .wfifo = std.fifo.LinearFifo(u8, .Dynamic).init(allocator),
+            // .wbuf = undefined,
+            // .wlen = 0,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.wfifo.deinit();
+        self.c.stream.close();
+    }
 
     pub fn write(self: *Self, data: []const u8) !void {
         var sum: usize = 0;
@@ -23,13 +41,7 @@ const Client = struct {
             const n = self.c.stream.write(data) catch |err| switch (err) {
                 error.WouldBlock => {
                     log.info("buffer is full", .{});
-                    // todo: 将未写完的数据加入缓冲区
-                    var l = sum + 2048;
-                    if (l > data.len) {
-                        l = data.len;
-                    }
-                    @memcpy(self.wbuf[0..], data[sum..l]);
-                    self.wlen = l - sum;
+                    try self.wfifo.write(data[sum..]);
                     var ev: linux.epoll_event = .{
                         .events = linux.EPOLL.OUT | linux.EPOLL.IN | linux.EPOLL.ET,
                         .data = linux.epoll_data{ .fd = self.c.stream.handle },
@@ -49,17 +61,32 @@ const Client = struct {
     }
 
     pub fn epoll_write(self: *Self) !void {
-        _ = try self.c.stream.write(self.wbuf[0..self.wlen]);
-        self.wlen = 0;
         var ev: linux.epoll_event = .{
             .events = linux.EPOLL.IN | linux.EPOLL.ET,
             .data = linux.epoll_data{ .fd = self.c.stream.handle },
         };
         try posix.epoll_ctl(self.epfd, linux.EPOLL.CTL_MOD, self.c.stream.handle, &ev);
-    }
 
-    pub fn close(self: *Self) void {
-        self.c.stream.close();
+        const data = self.wfifo.readableSlice(0);
+        var sum: usize = 0;
+        var send_buf_size = data.len;
+        while (send_buf_size > 0) {
+            const n = self.c.stream.write(data[sum..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    log.info("epoll write buffer is full", .{});
+                    if (self.wfifo.readableLength() > 0) {
+                        ev.events = linux.EPOLL.OUT | linux.EPOLL.IN | linux.EPOLL.ET;
+                        try posix.epoll_ctl(self.epfd, linux.EPOLL.CTL_MOD, self.c.stream.handle, &ev);
+                    }
+                    return;
+                },
+                else => return err,
+            };
+            self.wfifo.discard(n);
+            send_buf_size -= n;
+            sum += n;
+            log.info("epoll write len: {d}", .{n});
+        }
     }
 };
 const host = "127.0.0.1";
@@ -85,7 +112,7 @@ const Server = struct {
         std.log.info("server deinit: {d}", .{max_size});
         var it = self.*.clients.iterator();
         while (it.next()) |kv| {
-            kv.value_ptr.close();
+            kv.value_ptr.deinit();
         }
         self.*.clients.deinit();
     }
@@ -99,17 +126,21 @@ const Server = struct {
             _ = try posix.fcntl(connect.stream.handle, posix.F.SETFL, posix.SOCK.NONBLOCK);
 
             const key = connect.stream.handle;
-            try self.*.clients.put(key, .{
-                .epfd = epfd,
-                .c = connect,
-                .ev = .{
-                    .events = linux.EPOLL.IN | linux.EPOLL.ET,
-                    .data = linux.epoll_data{ .fd = key },
-                },
-                .rbuf = undefined,
-                .wbuf = undefined,
-                .wlen = 0,
-            });
+            try self.*.clients.put(key, try Client.init(self.allocator, epfd, connect, .{
+                .events = linux.EPOLL.IN | linux.EPOLL.ET,
+                .data = linux.epoll_data{ .fd = key },
+            }));
+            // try self.*.clients.put(key, .{
+            //     .epfd = epfd,
+            //     .c = connect,
+            //     .ev = .{
+            //         .events = linux.EPOLL.IN | linux.EPOLL.ET,
+            //         .data = linux.epoll_data{ .fd = key },
+            //     },
+            //     .rbuf = undefined,
+            //     .wbuf = undefined,
+            //     .wlen = 0,
+            // });
             errdefer _ = self.*.clients.remove(key);
 
             const client = self.*.clients.getPtr(connect.stream.handle);
@@ -223,7 +254,7 @@ fn write_hello(client: *Client) void {
         const gpa_deinit_status = gpa.deinit();
         if (gpa_deinit_status == .leak) @panic("TEST FAIL");
     }
-    const data = allocator.alloc(u8, 20480000) catch |err| {
+    const data = allocator.alloc(u8, 204800000) catch |err| {
         log.err("failed to create write data. {?}", .{err});
         return;
     };
